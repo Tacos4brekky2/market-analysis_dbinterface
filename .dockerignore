@@ -1,0 +1,16 @@
+.DS_Store
+**/.DS_Store
+__pycache__/
+**/__pycache__/
+*.pyc
+*.pyo
+venv/
+.env/
+tests/
+*.md
+*.env
+config.local.yaml
+*.log
+logs/
+Dockerfile
+.dockerignore
