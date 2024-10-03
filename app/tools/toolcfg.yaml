@@ -1,0 +1,4 @@
+process_read:
+process_write:
+  external:
+    alpha-vantage: :w

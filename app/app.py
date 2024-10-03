@@ -1,139 +1,174 @@
-import pandas as pd
+import os
+import time
 import json
-from tools import message_maker, DBConnection
-from flask import Flask, request, Response
+import asyncio
+from redis import asyncio as aioredis
+import motor.motor_asyncio
 
 
-class DatabaseAPI:
-    def __init__(self, flask_app: Flask):
-        self.app = flask_app
-        self.register_routes()
+# Database IO service for https://github.com/Tacos4brekky2/market-analysis_server
 
-    def register_routes(self):
-        self.app.add_url_rule("/", "home", self.home, methods=["GET"])
-        self.app.add_url_rule("/read", "read", self.read, methods=["POST"])
-        self.app.add_url_rule("/write", "write", self.write, methods=["POST"])
+INPUT_STREAMS = ["client-out", "updater-out"]
+OUTPUT_STREAM = "client-in"
+CONSUMER_GROUP = "market-analysis_server"
+CONSUMER_NAME = "interface-consumer"
 
-    def home(self):
-        return message_maker("StonksDB API home.", 200)
+REDIS_PARAMS = {
+    "host": os.getenv("REDIS_HOST", "localhost"),
+    "port": os.getenv("REDIS_PORT", "6379"),
+    "password": os.getenv("REDIS_PASSWORD", ""),
+}
+MONGO_PARAMS = {
+    "host": os.getenv("MONGO_HOST", "localhost"),
+    "port": os.getenv("MONGO_PORT", "27017"),
+    "password": os.getenv("MONGO_PASSWORD", ""),
+}
 
-    def write(self) -> Response:
-        json_data = request.json
-        debug_values = {
-            "Request data": False,
-            "Database connection": False,
-            "Cache connection": False,
-            "Cached data": False,
-            "Existing data": False,
-            "Data stored": False,
-        }
+
+def deserialize_message(message):
+    deserialized_message = dict()
+    for key, value in message.items():
         try:
-            if not json_data:
-                return message_maker("Request data not provided.", 560, debug_values)
-            debug_values["Request data"] = True
-            db = DBConnection().connect("mongodb")
-            if not db:
-                return message_maker("Connection failed: MongoDB.", 560, debug_values)
-            debug_values["Database connection"] = True
-            cache = DBConnection().connect(dbms="redis")
-            if not cache:
-                return message_maker("Connection failed: Redis", 560, debug_values)
-            debug_values["Cache connection"] = True
-            db_name = json_data["cache_info"]["destination"]
-            table_name = json_data["meta"]["table"]
-            collection_name = json_data["meta"]["collection"]
-            collection = db[db_name][collection_name]
-            collection_list = [x for x in collection.find()]
-            cached_data = json.loads(cache.get(f"{collection_name}:{table_name}"))
-            if not cached_data:
-                return message_maker("No data found in cache.", 560, debug_values)
-            debug_values["Cached data"] = True
-            existing_data = dict()
-            for entry in collection_list:
-                if entry["meta"]["table"] == table_name:
-                    existing_data = entry
-                    break
-            if not existing_data:
-                insert_result = collection.insert_one(json_data["data"])
-                return message_maker("Database write success.", 200, debug_values)
-            debug_values["Existing data"] = True
-            df_insert_data = pd.DataFrame(**json_data["data"])
-            df_existing_data = pd.DataFrame(**existing_data["data"])
-            # Remove all data that is already in the database and insert.
-            missing = self.missing_data(
-                data=df_insert_data, existing_data=df_existing_data
-            )
-            if missing.empty:
-                return message_maker(
-                    "Database write failure: Data already up to date.",
-                    560,
-                    debug_values,
-                )
-            else:
-                insert_data = {
-                    "meta": json_data["meta"],
-                    "data": missing.to_dict(orient="split", index=False),
-                }
-                insert_result = collection.insert_one(insert_data)
-                debug_values["Data stored"] = True
-                return message_maker("Database write success", 200, debug_values)
-        except Exception as e:
-            return message_maker(
-                "Database write exception.", 560, {**debug_values, **{"exception": e}}
-            )
+            deserialized_message[key] = json.loads(value)
+        except (json.JSONDecodeError, TypeError):
+            deserialized_message[key.decode("utf-8")] = value.decode("utf-8")
+    return deserialized_message
 
-    def read(self) -> Response:
-        json_data = request.json
-        debug_values = {
-            "Request data": False,
-            "Database connection": False,
-            "Data found": False,
-        }
+
+async def create_redis_groups(redis, input_streams: list):
+    for stream in input_streams:
         try:
-            if not json_data:
-                return message_maker(
-                    "Read request data not provided.", 500, debug_values
-                )
-            debug_values["Request data"] = True
-            db = DBConnection().connect("mongodb")
-            if not db:
-                return message_maker("Connection failed: MongoDB.", 560, debug_values)
-            debug_values["Database connection"] = True
-            collection = json_data["collection"]
-            table = json_data["table"]
-            filters = json_data["filters"]
-            return_data = db[collection][table].find_one()
-            if not return_data:
-                return message_maker(
-                    "Database read failed: data not found.",
-                    560,
-                    debug_values,
-                )
-            debug_values["Data found"] = True
-            return message_maker(
-                "Database read successful.", 200, debug_values, data=return_data
-            )
+            await redis.xgroup_create(stream, CONSUMER_GROUP, id="0", mkstream=True)
         except Exception as e:
-            return message_maker(
-                "Database API read exception.",
-                560,
-                {**debug_values, **{"exception": e}},
-            )
+            print(f"Error creating consumer group: {e}")
 
-    def missing_data(
-        self, data: pd.DataFrame, existing_data: pd.DataFrame
-    ) -> pd.DataFrame:
-        res = pd.DataFrame()
-        if existing_data.empty:
-            return data
-        mask = data.apply(tuple, 1).isin(existing_data.apply(tuple, 1))
-        res = data.mask(mask).dropna()
-        return res
+
+async def consume(redis, mongo, input_streams: list):
+    await create_redis_groups(redis=redis, input_streams=input_streams)
+    while True:
+        messages = await redis.xreadgroup(
+            groupname=CONSUMER_GROUP,
+            consumername=CONSUMER_NAME,
+            streams={stream: ">" for stream in input_streams},
+            count=10,
+        )
+        for stream, message_list in messages:
+            for message_id, message in message_list:
+                deserialized_message = deserialize_message(message)
+                await handle_message(
+                    redis=redis,
+                    mongo=mongo,
+                    stream=stream,
+                    message=deserialized_message,
+                    message_id=message_id,
+                )
+
+
+async def handle_message(redis, mongo, stream: str, message, message_id):
+    try:
+        message_type = message["type"]
+        request_id = message["request_id"]
+        del message["type"]
+        del message["request_id"]
+        match message_type:
+            case "DATA_FETCHED":
+                await write(data=message, mongo=mongo)
+                await produce(
+                    redis=redis,
+                    message_type="DATA_STORED",
+                    request_id=request_id,
+                    payload={},
+                    stream="client-in",
+                )
+            case "DATA_REQUESTED":
+                print(f"Consumed message {message_id}")
+                data = await read(params=message, mongo=mongo)
+                if data:
+                    await produce(
+                        redis=redis,
+                        request_id=request_id,
+                        message_type="DATA_READ",
+                        payload=data,
+                        stream="client-in",
+                    )
+                    await redis.xack(stream, CONSUMER_GROUP, message_id)
+                else:
+                    await produce(
+                        redis=redis,
+                        request_id=request_id,
+                        message_type="FETCH_REQUEST",
+                        payload=message,
+                        stream="updater-in",
+                    )
+    except json.JSONDecodeError:
+        print("Failed to decode JSON message")
+    except Exception as e:
+        print(f"Interface error: {e}")
+
+
+async def produce(redis, request_id, message_type: str, payload: dict, stream: str):
+    if isinstance(payload, list):
+        return
+    else:
+        message = {
+            k: (json.dumps(v) if isinstance(v, dict) else str(v))
+            for k, v in payload.items()
+        }
+        message["type"] = message_type
+        message["request_id"] = request_id
+        response = await redis.xadd(stream, fields=message)
+        print(f"Produce response: {response}")
+
+
+async def write(data: dict, mongo):
+    print("Writing data")
+    storage_data = dict()
+    for key, value in data.items():
+        if isinstance(key, bytes):
+            storage_data[key.decode("utf-8")] = value
+        else:
+            storage_data[key] = value
+    try:
+        collection = mongo["stonksdev"]["main"]
+        await collection.insert_one(storage_data)
+    except Exception as e:
+        print(f"Error processing write request: {e}")
+
+
+async def read(params: dict, mongo) -> dict:
+    print("Prcessing read request.")
+    document = dict()
+    sortkey = params["sortkey"]
+    del params["sortkey"]
+    try:
+        collection = mongo["stonksdev"]["main"]
+        cursor = collection.find({"params": params}).sort(sortkey)
+        document = await cursor.to_list(length=100)
+        document = document[0]
+        del document["_id"]
+    except Exception as e:
+        print(f"Error processing read request: {e}")
+        document = dict()
+    finally:
+        return document
+
+
+async def main():
+    redis = aioredis.from_url(
+        f'redis://{REDIS_PARAMS["host"]}:{REDIS_PARAMS["port"]}',
+        password=os.getenv("REDIS_PASSWORD", ""),
+    )
+    mongo = motor.motor_asyncio.AsyncIOMotorClient(
+        f'mongodb://{MONGO_PARAMS["host"]}:{MONGO_PARAMS["port"]}'
+    )
+    try:
+        while True:
+            await consume(redis=redis, mongo=mongo, input_streams=INPUT_STREAMS)
+    except KeyboardInterrupt:
+        print("Shutting down...")
+    finally:
+        print("Interface shut down.")
 
 
 if __name__ == "__main__":
-    app = Flask(__name__)
-    port = 5000
-    host = "localhost"
-    interface = DatabaseAPI(flask_app=app)
-    app.run(host=host, port=port, debug=False)
+    asyncio.run(main())
